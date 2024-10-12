@@ -1,0 +1,219 @@
+c
+
+
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Text.Json;
+using System.Globalization;
+using RapidLRProcessor.Dataset;
+using System.Diagnostics;
+using RapidLRProcessor.Rule;
+using Microsoft.OData.UriParser;
+using static System.Net.Mime.MediaTypeNames;
+using System.Reflection;
+
+namespace RapidLRProcessor
+{
+    class Program:CommonDataReferencesProd
+    {
+        static async Task Main(string[] args)
+        {
+            try
+            {
+                await LoadPrerequisitesAsync();
+
+                await Program.RunStartTimeChangeFeed();
+
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"{e.Message} | {e.InnerException} | {e.StackTrace}");
+            }
+        }
+        static async Task LoadPrerequisitesAsync()
+        {
+            Console.WriteLine("Loading Masters...");
+
+            await LoadLookup(Ls_List, Ls_query_defi);
+        }
+
+        private static async Task LoadLookup<T>(List<T> Ls_Lookup, QueryDefinition LkpQueryDefination)
+        {
+            Ls_Lookup.Clear();
+            Stopwatch LookUpWatch = Stopwatch.StartNew();
+            using FeedIterator<T> branchfeedIterator = container_LookUps.GetItemQueryIterator<T>(LkpQueryDefination);
+            double LookUpRU = 0;
+            while (branchfeedIterator.HasMoreResults)
+            {
+                FeedResponse<T> cosresponse = await branchfeedIterator.ReadNextAsync();
+                foreach (var item in cosresponse)
+                {
+                    Ls_Lookup.Add(item);
+                }
+                LookUpRU += cosresponse.RequestCharge;
+            }
+            LookUpWatch.Stop();
+            Console.WriteLine($"{Ls_Lookup?.FirstOrDefault()?.GetType()?.Name} master Loaded with {Ls_Lookup?.Count} items in {LookUpWatch?.ElapsedMilliseconds * 0.001} seconds using {LookUpRU} RU");
+        }
+
+        static async Task RunStartTimeChangeFeed()
+        {
+            DateTime particularPointInTime = DateTime.UtcNow;//new DateTime(2022, 01, 12, 9, 24, 43, DateTimeKind.Utc);//DateTime.UtcNow; //.AddHours(-13); //new DateTime(2020,12,16,8,30,0,DateTimeKind.Utc);   // DateTime.UtcNow; 
+
+            //Console.WriteLine($"{ExtensionFunctions.GetCurrentUNIX()}");
+            // <TimeInitialization>
+
+            #region changefeed diagnostic code to be used for issues in change feed
+            //Type defaultTrace = Type.GetType("Microsoft.Azure.Cosmos.Core.Trace.DefaultTrace,Microsoft.Azure.Cosmos.Direct");
+            //TraceSource traceSource = (TraceSource)defaultTrace.GetProperty("TraceSource").GetValue(null);
+            //traceSource.Switch.Level = SourceLevels.All;
+            //traceSource.Listeners.Clear();
+            //traceSource.Listeners.Add(new ConsoleTraceListener());
+            #endregion
+
+            ChangeFeedProcessor changeFeedProcessor = monitoredContainer
+                .GetChangeFeedProcessorBuilder<RapidLRLeadModel>(SubcriberID, Program.HandleChangesAsync)
+                    .WithInstanceName(WithInstanceName)
+                    .WithLeaseContainer(container_Leases)
+                    .WithStartTime(particularPointInTime)//DateTime.MinValue.ToUniversalTime())
+                    .Build();
+            // </TimeInitialization>
+
+            Console.WriteLine($"\nStarting Change Feed Processor with changes after {particularPointInTime}...");
+            await changeFeedProcessor.StartAsync();
+            Console.WriteLine("\nChange Feed Processor started.");
+
+            // Wait random time for the delegate to output all messages after initialization is done
+            await Task.Delay(5000);
+            Console.Read();
+            //Console.ReadKey();
+
+            await changeFeedProcessor.StopAsync();
+
+
+        }// RunStartTimeChangeFeed Ending
+
+        static async Task HandleChangesAsync(IReadOnlyCollection<RapidLRLeadModel> lead, CancellationToken cancellationToken)
+        {
+            try
+            {
+                string BatchGuid = Guid.NewGuid().ToString();
+                string FeedRecTime = ExtensionFunctions.GetISTGetDate();
+                string GenesysToken = await ExtensionTasks.GenesysAPITokenAsync("GenesysAPIToken", container_Leases);
+                string CISCOToken = await ExtensionTasks.CISCOAPITokenAsync("LCMHotLeadToken", container_Leases);
+
+                await lead.ParallelForEachAsync(async doc => await LeadProcessAsync(doc, BatchGuid, FeedRecTime, GenesysToken, CISCOToken), Environment.ProcessorCount);
+
+            }//Try Closing
+            catch (Exception e)
+            {
+                try
+                {
+                    DefaultErrorLog ErrLog = new DefaultErrorLog()
+                    {
+                        id = Guid.NewGuid().ToString(),
+                        ExceptionMsg = e.Message?.ToString(),
+                        ExceptionType = "RapidLRHandleChangesAsync",
+                        InnerException = e.InnerException?.ToString(),
+                        StackTrace = e.StackTrace?.ToString(),
+                        CreatedDate = ExtensionFunctions.GetISTGetDate()
+
+                    };
+                    await DbLogger(container_ErrorLogs, ErrLog, ErrLog?.id);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"RapidLRHandleChangesAsync Catch Failed: {ex.Message}");
+                }
+            }
+
+        }
+
+        static async Task LeadProcessAsync(RapidLRLeadModel doc, string BatchGuid, string FeedRecTime, string GenesysToken ,string CISCOToken)
+        {
+            if (doc?.business?.ToUpper() == "PL")
+            {
+                RapidLRLog dlog = new RapidLRLog();
+                try
+                {
+
+----------------------------------------------------------------------
+
+public static Task ParallelForEachAsync<T>
+(this IEnumerable<T> source, Func<T, Task> funcBody, int maxDoP = 4)
+        {
+            async Task AwaitPartition(IEnumerator<T> partition)
+            {
+                using (partition)
+                {
+                    while (partition.MoveNext())
+                    { await funcBody(partition.Current); }
+                }
+            }
+
+            return Task.WhenAll(
+                Partitioner
+                    .Create(source)
+                    .GetPartitions(maxDoP)
+                    .AsParallel()
+                    .Select(p => AwaitPartition(p)));
+        }
+		
+---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+------------------------------------------------------
+
+public static async Task<APIResponse> CiscoAPIPostAsync(HttpClient httpClient, string URL, string RequestContent, string AuthToken)
+        {
+            HttpContent rescontent = new StringContent(RequestContent, Encoding.UTF8, "application/json");
+
+            HttpRequestMessage resrequest = new HttpRequestMessage(HttpMethod.Post, URL);
+
+            resrequest.Headers.Add("Authorization", AuthToken);
+            resrequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            resrequest.Content = rescontent;
+
+            APIResponse ResponseObj = new APIResponse()
+            {
+                RespReqTime = ExtensionFunctions.GetISTGetDate()
+            };
+            var requestTimeout = TimeSpan.FromSeconds(20);
+            try
+            {
+                using (var tokenSource = new CancellationTokenSource(requestTimeout))
+                {
+                    HttpResponseMessage resresponse = await httpClient.SendAsync(resrequest, tokenSource.Token);
+                    ResponseObj.RespResponse = await resresponse.Content.ReadAsStringAsync();
+                    ResponseObj.RespRespTime = ExtensionFunctions.GetISTGetDate();
+                }
+            }
+            catch(Exception ex)
+            {
+                ResponseObj.RespRespTime = ExtensionFunctions.GetISTGetDate();
+                RetriggerOutput output = new RetriggerOutput()
+                {
+                    APIContent = RequestContent,
+                    ExceptionType = "RapidLR1CiscoAPI",
+                    APIName = "CISCO",
+                    ExceptionMsg = ex.Message?.ToString(),
+                    InnerException = ex.InnerException?.ToString(),
+                    StackTrace = ex.StackTrace?.ToString()
+                };
+                ResponseObj.RespResponse = JsonSerializer.Serialize<RetriggerOutput>(output);
+            }
+            return ResponseObj;
+        }
+		
+
